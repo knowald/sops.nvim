@@ -41,6 +41,23 @@ local function marked_rows()
   return rows
 end
 
+local function change_signs()
+  local signs = {}
+  local marks = vim.api.nvim_buf_get_extmarks(0, vim.api.nvim_create_namespace("sops_changes"), 0, -1, { details = true })
+  for _, mark in ipairs(marks) do
+    table.insert(signs, mark[2] .. " " .. mark[4].sign_hl_group)
+  end
+  return signs
+end
+
+-- TextChanged does not fire by itself while a script runs.
+local function changes_shown(expected)
+  return vim.wait(10000, function()
+    vim.api.nvim_exec_autocmds("TextChanged", { buffer = 0 })
+    return vim.deep_equal(change_signs(), expected)
+  end, 50)
+end
+
 local function refused(command, description)
   local on_disk = vim.fn.readfile(file)
   assert(not pcall(vim.cmd, command), description .. " reports an error")
@@ -60,6 +77,9 @@ vim.fn.writefile({ "first_password: alpha", "second_password: beta", "plain: vis
 vim.env.SOPS_AGE_KEY_FILE = key_file
 vim.env.SOPS_AGE_SSH_PRIVATE_KEY_FILE = nil
 shell({ "sops", "encrypt", "-i", file })
+shell({ "git", "init", "--quiet" })
+shell({ "git", "add", "test.sops.yml" })
+shell({ "git", "-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "test" })
 
 vim.cmd("filetype on")
 vim.o.clipboard = "unnamedplus"
@@ -81,7 +101,16 @@ assert(#buffer_lines() == 4, "undo does not empty the buffer")
 local first_before = ciphertext("first_password")
 local second_before = ciphertext("second_password")
 vim.api.nvim_buf_set_lines(0, 1, 2, false, { "second_password: changed" })
+assert(changes_shown({ "1 Changed" }), "shows a change against the last commit")
 vim.cmd.write()
+assert(changes_shown({ "1 Changed" }), "change stays marked after the write, it is not committed")
+vim.api.nvim_buf_set_lines(0, 0, 0, false, { "added: line" })
+assert(changes_shown({ "0 Added", "2 Changed" }), "shows an added line")
+vim.cmd("edit!")
+vim.api.nvim_buf_set_lines(0, 3, 4, false, {})
+assert(changes_shown({ "1 Changed", "2 Removed" }), "shows a deleted line on the line before it")
+vim.cmd("edit!")
+assert(changes_shown({ "1 Changed" }), "reload shows the changes on disk against the last commit")
 assert(not vim.bo.modified, "unmodified after write")
 assert(ciphertext("first_password") == first_before, "unchanged value keeps its ciphertext")
 assert(ciphertext("second_password") ~= second_before, "changed value is encrypted again")

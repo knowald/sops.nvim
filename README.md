@@ -25,7 +25,9 @@ return {
 }
 ```
 
-There is nothing to configure.
+There is nothing to configure. The `encrypted on disk` annotation uses the
+`SopsEncrypted` highlight group, which links to
+`DiagnosticVirtualTextHint` by default.
 
 ## Behavior
 
@@ -56,8 +58,13 @@ There is nothing to configure.
 - The `clipboard` option is cleared while a decrypted buffer is current, so
   yanks and deletes stay out of the system clipboard. Use the `"+` register to
   copy on purpose.
-- The buffer has `buftype=acwrite`. Git signs and language servers do not
-  attach to it, and format-on-save does not run.
+- The buffer has `buftype=acwrite`. Git integrations and language servers do
+  not attach to it, and format-on-save does not run.
+- The sign column shows added, changed and deleted lines compared with the
+  decrypted file from the last commit (`HEAD`). The signs are display only;
+  there is no staging or resetting of hunks. They are absent when the file is
+  not committed yet or the committed version cannot be decrypted with your
+  key, and they follow a new commit after the file is reloaded with `:e`.
 
 ## What is not covered
 

@@ -24,6 +24,12 @@ local winbar = "%{%get(b:,'sops_winbar','')%}"
 
 local group = vim.api.nvim_create_augroup("sops", { clear = true })
 local namespace = vim.api.nvim_create_namespace("sops")
+local change_namespace = vim.api.nvim_create_namespace("sops_changes")
+
+local diff = vim.text and vim.text.diff or vim.diff
+
+-- Decrypted contents of each buffer's file in the last commit.
+local committed = {}
 
 local function run_sops(arguments, file, options)
   if vim.fn.executable("sops") == 0 then
@@ -95,12 +101,76 @@ local function mark_encrypted_lines(buffer, file)
         return
       end
       vim.api.nvim_buf_set_extmark(buffer, namespace, row - 1, 0, {
-        virt_text = { { "encrypted on disk", "DiagnosticVirtualTextOk" } },
+        virt_text = { { "encrypted on disk", "SopsEncrypted" } },
         virt_text_pos = "eol",
       })
       row = row + 1
     end
   end
+end
+
+local function change_highlight(kind)
+  local name = "GitSigns" .. kind
+  return vim.fn.hlexists(name) == 1 and name or ({ Add = "Added", Change = "Changed", Delete = "Removed" })[kind]
+end
+
+-- Git integrations compare against the committed ciphertext and can stage
+-- plaintext, so they are kept off the buffer. These signs compare the buffer
+-- with the decrypted last commit instead and offer no actions.
+local function mark_changes(buffer)
+  vim.api.nvim_buf_clear_namespace(buffer, change_namespace, 0, -1)
+  if not committed[buffer] or not vim.b[buffer].sops_decrypted then
+    return
+  end
+  local function place(row, text, kind)
+    vim.api.nvim_buf_set_extmark(buffer, change_namespace, row - 1, 0, {
+      sign_text = text,
+      sign_hl_group = change_highlight(kind),
+    })
+  end
+  local lines = vim.api.nvim_buf_get_lines(buffer, 0, -1, false)
+  local hunks = diff(committed[buffer], table.concat(lines, "\n") .. "\n", { result_type = "indices" })
+  for _, hunk in ipairs(hunks) do
+    local _, removed, start, added = unpack(hunk)
+    if added == 0 then
+      place(math.max(start, 1), "_", "Delete")
+    else
+      for row = start, start + added - 1 do
+        place(row, "\u{258e}", removed == 0 and "Add" or "Change")
+      end
+    end
+  end
+end
+
+-- Runs in the background so that opening a file does not wait for a second decrypt.
+local function load_committed(buffer, file)
+  committed[buffer] = nil
+  if vim.fn.executable("git") == 0 then
+    return
+  end
+  local directory = vim.fs.dirname(file)
+  local show = { "git", "show", "HEAD:./" .. vim.fs.basename(file) }
+  vim.system(
+    show,
+    { text = true, cwd = directory },
+    vim.schedule_wrap(function(shown)
+      if shown.code ~= 0 then
+        return
+      end
+      -- Fails to start when the directory is gone by now; there is nothing to compare with then.
+      pcall(
+        vim.system,
+        { "sops", "decrypt", "--filename-override", file, "/dev/stdin" },
+        { text = true, cwd = directory, detach = true, stdin = shown.stdout, timeout = timeout_milliseconds },
+        vim.schedule_wrap(function(result)
+          if result.code == 0 and vim.api.nvim_buf_is_valid(buffer) then
+            committed[buffer] = result.stdout
+            mark_changes(buffer)
+          end
+        end)
+      )
+    end)
+  )
 end
 
 local function show_encrypted(buffer, file, decrypt_failed)
@@ -110,6 +180,7 @@ local function show_encrypted(buffer, file, decrypt_failed)
   vim.bo[buffer].modifiable = false
   vim.b[buffer].sops_decrypted = false
   vim.api.nvim_buf_clear_namespace(buffer, namespace, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buffer, change_namespace, 0, -1)
   if decrypt_failed then
     set_winbar(buffer, "DiagnosticError", "decrypt failed [RO]", ":SopsToggle")
   else
@@ -129,6 +200,7 @@ local function show_decrypted(buffer, file)
   vim.b[buffer].sops_fingerprint = fingerprint(file)
   vim.b[buffer].sops_decrypted = true
   mark_encrypted_lines(buffer, file)
+  load_committed(buffer, file)
   set_winbar(buffer, "DiagnosticWarn", "decrypted", ":SopsToggle")
 end
 
@@ -216,6 +288,7 @@ local function write(event)
     if normalized then
       mark_encrypted_lines(buffer, file)
     end
+    mark_changes(buffer)
     vim.notify(('"%s" encrypted and written'):format(name))
   else
     report_error("file not written, encrypt failed:\n" .. vim.trim(result.stderr))
@@ -243,6 +316,20 @@ local function protect(buffer)
   )
   vim.api.nvim_create_autocmd("BufEnter", { group = group, buffer = buffer, callback = suspend_clipboard })
   vim.api.nvim_create_autocmd("BufLeave", { group = group, buffer = buffer, callback = restore_clipboard })
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    group = group,
+    buffer = buffer,
+    callback = function()
+      mark_changes(buffer)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    group = group,
+    buffer = buffer,
+    callback = function()
+      committed[buffer] = nil
+    end,
+  })
   vim.api.nvim_buf_create_user_command(buffer, "SopsToggle", function()
     toggle(buffer)
   end, { desc = "Switch between the decrypted and the stored, encrypted contents" })
@@ -277,6 +364,13 @@ local function read(event)
 end
 
 vim.api.nvim_create_autocmd("BufReadCmd", { group = group, pattern = patterns, callback = read })
+
+-- A colorscheme clears the group, so the default is set again after each one.
+local function set_default_highlight()
+  vim.api.nvim_set_hl(0, "SopsEncrypted", { default = true, link = "DiagnosticVirtualTextHint" })
+end
+set_default_highlight()
+vim.api.nvim_create_autocmd("ColorScheme", { group = group, callback = set_default_highlight })
 
 -- Window options stay with the window when it shows another buffer, so the
 -- winbar is also taken away again here.
